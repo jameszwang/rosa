@@ -1,6 +1,7 @@
 package profilehandler
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -564,4 +565,154 @@ func CreateClusterByProfile(profile *Profile, client *rosacli.Client, waitForClu
 	}
 
 	return description, err
+}
+
+func WaitForClusterUninstalled(client *rosacli.Client, cluster string, timeoutMin int) error {
+
+	endTime := time.Now().Add(time.Duration(timeoutMin) * time.Minute)
+	sleepTime := 0
+	for time.Now().Before(endTime) {
+		output, err := client.Cluster.DescribeClusterAndReflect(cluster)
+		if err != nil {
+			outputInfo, err := client.Cluster.DescribeCluster(cluster)
+			if strings.Contains(outputInfo.String(), "There is no cluster with identifier or name '"+cluster+"'") {
+				log.Logger.Infof("Cluster %s has been deleted.", cluster)
+				return nil
+			} else {
+				return err
+			}
+		}
+
+		switch output.State {
+		default:
+			if strings.Contains(output.State, CON.Uninstalling) {
+				time.Sleep(2 * time.Minute)
+				continue
+			}
+			if strings.Contains(output.State, CON.Ready) {
+				log.Logger.Infof("Cluster is in status of %v, wait for uninstalling", CON.Ready)
+				if sleepTime >= 6 {
+					return fmt.Errorf("cluster stuck to %s status for more than 6 mins.", output.State)
+				}
+				sleepTime += 2
+				time.Sleep(2 * time.Minute)
+				continue
+			}
+			if strings.Contains(output.State, CON.Error) {
+				log.Logger.Errorf("Cluster is in %s status now. Recording the installation log", CON.Error)
+				RecordClusterInstallationLog(client, cluster)
+				return fmt.Errorf("cluster %s is in %s state with reason: %s",
+					cluster, CON.Error, output.State)
+			}
+			return fmt.Errorf("unknown cluster state %s", output.State)
+
+		}
+	}
+	return fmt.Errorf("timeout for cluster ready waiting after %d mins", timeoutMin)
+}
+
+func DestroyClusterByProfile(client *rosacli.Client, waitForClusterUninstall bool) (errors []error) {
+	var (
+		ud                 UserData
+		cd                 ClusterDetail
+		clusterService     rosacli.ClusterService
+		errDeleteCluster   error
+		ocmResourceService rosacli.OCMResourceService
+	)
+
+	// get cluster info from cluster detail file
+	cdContent, err := common.ReadFileContent(config.Test.ClusterDetailFile)
+	if err != nil {
+		log.Logger.Errorf("Error happened when read cluster detail: %s", err.Error())
+		errors = append(errors, err)
+		return
+	}
+	fmt.Println(cdContent)
+	err = json.Unmarshal([]byte(cdContent), &cd)
+	if err != nil {
+		log.Logger.Errorf("Error happend when parse cluster detail file to ClusterDetail struct: %s", err.Error())
+		errors = append(errors, err)
+		return
+	}
+
+	// delete cluster
+	clusterService = client.Cluster
+	output, errDeleteCluster := clusterService.DeleteCluster(cd.ClusterID, "-y")
+	if errDeleteCluster != nil {
+		log.Logger.Errorf("Error happened when delete cluster: %s", output.String())
+		errors = append(errors, errDeleteCluster)
+	}
+	if waitForClusterUninstall {
+		log.Logger.Infof("Waiting for the cluster %s to uninstalled", cd.ClusterID)
+		err = WaitForClusterUninstalled(client, cd.ClusterID, config.Test.GlobalENV.ClusterWaitingTime)
+		if err != nil {
+			log.Logger.Errorf("Error happened when waitling cluster uninstall: %s", err.Error())
+			errors = append(errors, err)
+		} else {
+			log.Logger.Infof("Delete cluster %s successfully.", cd.ClusterID)
+		}
+	}
+
+	// get user data from resource file
+	udContent, err := common.ReadFileContent(config.Test.UserDataFile)
+	if err != nil {
+		log.Logger.Errorf("Error happened when read user data: %s", err.Error())
+		errors = append(errors, err)
+		return
+	}
+	err = json.Unmarshal([]byte(udContent), &ud)
+	if err != nil {
+		log.Logger.Errorf("Error happend when parse resource file data to UserData struct: %s", err.Error())
+	}
+
+	// delete KMS key
+	if ud.KMSKey != "" {
+		fmt.Printf("kms key: %s", ud.KMSKey)
+		// DeleteKMSKeyDummy()
+	}
+	// delete audit log arn
+	if ud.AuditLogArn != "" {
+		fmt.Printf("audit log arn: %s", ud.AuditLogArn)
+		// DeleteAuditlogDummy()
+	}
+	// delete vpc chain
+	if ud.VpcID != "" {
+		fmt.Printf("vpc id: %s", ud.VpcID)
+		// DeleteVPCChainDummy()
+	}
+	// delete operator roles
+	if ud.OperatorRolesPrefix != "" {
+		fmt.Printf("operator role prefix: %s", ud.OperatorRolesPrefix)
+		_, err := ocmResourceService.DeleteOperatorRoles("--prefix", ud.OperatorRolesPrefix, "--mode", "auto", "-y")
+		if err != nil {
+			log.Logger.Errorf("Error happened when delete operator role: %s", err.Error())
+			errors = append(errors, err)
+		} else {
+			log.Logger.Infof("Delete operator roles successfully for cluster: %s", cd.ClusterID)
+		}
+	}
+	// delete oidc config id
+	if ud.OIDCConfigID != "" {
+		fmt.Printf("oidc config id: %s", ud.OIDCConfigID)
+		_, err := ocmResourceService.DeleteOIDCConfig("--oidc-config-id", ud.OIDCConfigID, "--mode", "auto", "-y")
+		if err != nil {
+			log.Logger.Errorf("Error happened when delete oidc config id: %s", err.Error())
+			errors = append(errors, err)
+		} else {
+			log.Logger.Infof("Delete oidc config id successfully for cluster: %s", cd.ClusterID)
+		}
+	}
+	// delete account roles
+	if ud.AccountRolesPrefix != "" && errDeleteCluster == nil {
+		fmt.Printf("accout role prefix: %s", ud.AccountRolesPrefix)
+		_, err := ocmResourceService.DeleteAccountRole("--mode", "auto", "--prefix", ud.AccountRolesPrefix, "-y")
+		if err != nil {
+			log.Logger.Errorf("Error happened when delete account roles: %s", err.Error())
+			errors = append(errors, err)
+		} else {
+			log.Logger.Infof("Delete account roles successfully for cluster: %s", cd.ClusterID)
+		}
+	}
+
+	return
 }

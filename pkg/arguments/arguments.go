@@ -20,6 +20,7 @@ package arguments
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -325,10 +326,21 @@ func deprecateRegion(command *cobra.Command) {
 }
 
 func MarkRegionDeprecated(parentCmd *cobra.Command, childrenCmds []*cobra.Command) {
-	deprecateRegion(parentCmd)
 	for _, cmd := range childrenCmds {
 		cmd.SetHelpFunc(func(command *cobra.Command, strings []string) {
+			deprecateRegion(parentCmd)
 			command.Parent().HelpFunc()(command, strings)
 		})
+		currentRun := cmd.Run
+		cmd.Run = func(c *cobra.Command, args []string) {
+			outputFlag := cmd.Flag("output")
+			regionFlag := cmd.Flag("region")
+			hasChangedOutputFlag := outputFlag != nil && outputFlag.Value.String() != outputFlag.DefValue
+			hasChangedRegionFlag := regionFlag != nil && regionFlag.Value.String() != regionFlag.DefValue
+			if hasChangedRegionFlag && !hasChangedOutputFlag {
+				_, _ = fmt.Fprintf(os.Stdout, "%s%s\n", "\u001B[0;33mW:\u001B[m ", regionDeprecationMessage)
+			}
+			currentRun(c, args)
+		}
 	}
 }
